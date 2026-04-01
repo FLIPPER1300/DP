@@ -1,0 +1,12 @@
+Flask
+Flask-Cors
+Pillow
+sahi
+torch
+ultralytics
+numpy
+scikit-learn
+pandas
+torchvision
+torchaudio
+opencv-python
