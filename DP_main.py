@@ -43,14 +43,14 @@ OUTDIR = "image_bc_traj"
 BC_MODEL_PATH = "bc_model.pt"
 LOG_DIR = "logs/bc_reader_final"
 
-TRAIN_BC = False
-TRAIN_DAGGER = False
+TRAIN_BC = True
+TRAIN_DAGGER = True
 TRAIN_GAIL = True
 GAIL_START_MODEL = "dagger"  # prepínač: "bc" alebo "dagger". Určuje, aký model sa použije na začiatku GAIL
 N_EPOCHS = 20
 NUM_CANDIDATES = 15
 NUM_LINES_BELOW = 3  # Počet riadkov pod aktuálnym, v ktorých hľadáme kandidátov
-DAGGER_ITERATIONS = 5  # Počet iterácií
+DAGGER_ITERATIONS = 2  # Počet iterácií
 
 # Debug nastavenia
 DEBUG_CANDIDATES = False  # Ak True, vypíše info o kandidátoch pri generovaní
@@ -1035,11 +1035,11 @@ if TRAIN_GAIL:
     learner = PPO(
         "MlpPolicy", 
         venv, 
-        n_steps=1024, 
-        batch_size=64, 
-        ent_coef=0.01,         # Malá miera preskúmavania
-        learning_rate=1e-5,    # VELMI malý LR pre fine-tuning existujúceho DAgger modelu
-        clip_range=0.1,        # Prísnejší clip limit (default=0.2), zabráni degradácii pôvodnej politiky
+        n_steps=2048,          # Väčší rollout pre stabilnejšie aktualizácie (viac kontextu naraz)
+        batch_size=128,        # Väčší batch pre presnejšie gradienty
+        ent_coef=0.001,        # Minimalizovaná explorácia (odstráni zbytočné "náhodné" kroky na konci)
+        learning_rate=5e-6,    # Ešte menší LR aby sme si nerozbili to, čo vieme
+        clip_range=0.05,       # Extrémne prísne zamedzenie voči zmenám od pôvodnej politiky
         seed=0,
     )
 
@@ -1059,17 +1059,17 @@ if TRAIN_GAIL:
     
     gail_trainer = GAIL(
         demonstrations=transitions,
-        demo_batch_size=64, 
-        gen_replay_buffer_capacity=1024,
-        n_disc_updates_per_round=1,    # Diskriminátor nenecháme učiť sa príliš rýchlo dopredu
+        demo_batch_size=128,           # Zvýšená vzorka z experta aby lepšie porovnával
+        gen_replay_buffer_capacity=2048, 
+        n_disc_updates_per_round=1,    
         venv=venv,
         gen_algo=learner,
         reward_net=reward_net,
         allow_variable_horizon=True,
     )
     
-    print("Spúšťam GAIL tréning (jemný fine-tuning)...")
-    gail_trainer.train(total_timesteps=40000)
+    print("Spúšťam GAIL tréning (extrémne opatrný fine-tuning na dlhšiu dobu)...")
+    gail_trainer.train(total_timesteps=100000)
     
     model = learner.policy
     torch.save(model.state_dict(), BC_MODEL_PATH.replace(".pt", "_gail.pt"))
