@@ -12,6 +12,8 @@ function App() {
   const [processedImage, setProcessedImage] = useState('');
   const [trajectoryImage, setTrajectoryImage] = useState('');
   const [detectedString, setDetectedString] = useState('');
+  const [expectedString, setExpectedString] = useState('');
+  const [comparisonResults, setComparisonResults] = useState(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
 
@@ -43,6 +45,7 @@ function App() {
     setProcessedImage('');
     setTrajectoryImage('');
     setDetectedString('');
+    setComparisonResults(null);
     setLoading(true);
 
     if (!file) {
@@ -55,6 +58,9 @@ function App() {
     formData.append('file', file);
     formData.append('yolo_model', selectedYolo);
     formData.append('imitation_model', selectedImitation);
+    if (expectedString) {
+      formData.append('expected_string', expectedString);
+    }
 
     axios.post('http://localhost:5000/api/upload', formData, {
       headers: {
@@ -66,6 +72,14 @@ function App() {
       setProcessedImage(backendUrl + response.data.processed_image_url);
       setTrajectoryImage(backendUrl + response.data.trajectory_image_url);
       setDetectedString(response.data.detected_string);
+      if (response.data.expected_string) {
+        setComparisonResults({
+          expected: response.data.expected_string,
+          distance: response.data.levenshtein_distance,
+          accuracy: response.data.accuracy,
+          diffHtml: response.data.diff_html
+        });
+      }
     })
     .catch(error => {
       console.error('Error uploading file:', error);
@@ -123,7 +137,18 @@ function App() {
           <label>Upload Image:</label>
           <input type="file" onChange={handleFileChange} disabled={loading} />
         </div>
-        <button type="submit" disabled={loading}>
+        <div style={{ display: 'flex', flexDirection: 'column' }}>
+          <label style={{ marginBottom: '5px' }}>Expected String (Optional):</label>
+          <textarea 
+            style={{ width: '100%', boxSizing: 'border-box', marginTop: '5px' }}
+            rows="3"
+            value={expectedString} 
+            onChange={(e) => setExpectedString(e.target.value)} 
+            disabled={loading} 
+            placeholder="Enter expected string here" 
+          />
+        </div>
+        <button type="submit" disabled={loading} style={{ marginTop: '10px' }}>
           {loading ? 'Processing...' : 'Process Image'}
         </button>
       </form>
@@ -164,6 +189,20 @@ function App() {
           <div className="detected-string-container">
             <p>{detectedString}</p>
           </div>
+          {comparisonResults && (
+            <div className="comparison-container" style={{ marginTop: '20px', padding: '15px', border: '1px solid #ccc', borderRadius: '5px' }}>
+              <h3>Comparison Results</h3>
+              <p><strong>Levenshtein Distance:</strong> {comparisonResults.distance}</p>
+              <p><strong>Accuracy:</strong> {comparisonResults.accuracy}%</p>
+              {comparisonResults.diffHtml && (
+                <div 
+                  className="diff-container"
+                  style={{ marginTop: '15px', overflowX: 'auto' }}
+                  dangerouslySetInnerHTML={{ __html: comparisonResults.diffHtml }}
+                />
+              )}
+            </div>
+          )}
         </div>
       )}
 

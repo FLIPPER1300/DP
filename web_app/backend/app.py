@@ -10,6 +10,8 @@ from PIL import Image
 import json
 from collections import defaultdict
 from torchvision.ops import nms
+from rapidfuzz.distance import Levenshtein
+import difflib
 
 app = Flask(__name__)
 CORS(app)
@@ -71,7 +73,7 @@ def get_bounding_boxes_from_image(image_path, model_path):
 
     return all_boxes, all_scores, all_labels
 
-def non_max_suppression(boxes, scores, labels, conf_threshold=0.6, iou_threshold=0.3):
+def non_max_suppression(boxes, scores, labels, conf_threshold=0.5, iou_threshold=0.3):
     """Potlačenie nemaximálnych hodnôt pre bounding boxy pomocou torchvision.ops.nms."""
     if not boxes:
         return [], [], []
@@ -175,6 +177,16 @@ def draw_trajectory(image_path, trajectory, labels, output_path):
         cv2.putText(image, str(labels[i]), (pt[0] + 10, pt[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
     cv2.imwrite(output_path, image)
 
+def levenshtein_distance_and_accuracy(s1, s2):
+    if len(s1) == 0 and len(s2) == 0: 
+        return 0, 100.0
+    
+    dist = Levenshtein.distance(s1, s2)
+    accuracy = Levenshtein.normalized_similarity(s1, s2) * 100.0
+    return dist, accuracy
+
+def wrap_string(s, width=80):
+    return [s[i:i+width] for i in range(0, len(s), width)]
 
 # --- API Endpoints ---
 
@@ -195,6 +207,7 @@ def upload_file():
 
     yolo_model_name = request.form.get('yolo_model')
     imitation_model_name = request.form.get('imitation_model')
+    expected_string = request.form.get('expected_string', '').strip()
 
     if not yolo_model_name or not imitation_model_name:
         return jsonify({'error': 'Model not specified'}), 400
@@ -237,11 +250,54 @@ def upload_file():
         # 4. Vytvorenie stringu
         detected_string = "".join(map(str, trajectory_labels))
 
-        return jsonify({
+        response_data = {
             'processed_image_url': f'/results/{processed_image_filename}',
             'trajectory_image_url': f'/results/{trajectory_image_filename}',
             'detected_string': detected_string
-        })
+        }
+
+        if expected_string:
+            distance, accuracy = levenshtein_distance_and_accuracy(expected_string, detected_string)
+            
+            # Použi difflib.HtmlDiff rovnako ako v DP_main.py
+            expected_lines = wrap_string(expected_string, width=80)
+            detected_lines = wrap_string(detected_string, width=80)
+            
+            fromdesc = "Expected string"
+            todesc = "Detected string"
+            
+            diff_table = difflib.HtmlDiff(wrapcolumn=80).make_table(
+                expected_lines, detected_lines,
+                fromdesc=fromdesc,
+                todesc=todesc
+            )
+
+            diff_css = """
+            <style type="text/css">
+                table.diff {font-family:Courier; border-collapse: collapse; margin: 10px auto 0 auto; width: auto; min-width: 80%; text-align: left;}
+                table.diff th, table.diff td {padding: 5px; border: 1px solid #ccc;}
+                .diff_header {background-color:#e0e0e0}
+                td.diff_header {text-align:right; width: 5%;}
+                .diff_next {background-color:#c0c0c0; width: 5%;}
+                .diff_add {background-color:#aaffaa}
+                .diff_chg {background-color:#ffff77}
+                .diff_sub {background-color:#ffaaaa}
+            </style>
+            """
+            
+            diff_html = f"""
+            <div style="width: 100%; overflow-x: auto; text-align: center;">
+                {diff_css}
+                {diff_table}
+            </div>
+            """
+
+            response_data['expected_string'] = expected_string
+            response_data['levenshtein_distance'] = distance
+            response_data['accuracy'] = round(accuracy, 2)
+            response_data['diff_html'] = diff_html
+
+        return jsonify(response_data)
 
     except Exception as e:
         app.logger.error(f"Error processing file: {e}")
