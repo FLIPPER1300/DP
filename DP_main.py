@@ -12,6 +12,12 @@ from imitation.data import types as im_types
 from stable_baselines3.common.logger import configure
 from stable_baselines3.common.policies import ActorCriticPolicy
 
+from dp_core import (
+    Point, BBox, NUM_CANDIDATES, NUM_LINES_BELOW, 
+    load_json_data, compute_page_char_scale, build_coco_index, 
+    find_candidates, ReadingEnv, BaseDataLoader
+)
+
 try:
     from rapidfuzz import fuzz, distance
     from rapidfuzz.distance import Levenshtein
@@ -59,319 +65,6 @@ DEBUG_TRAJECTORY = False  # Ak True, vypíše detaily o každom kroku trajektór
 os.makedirs(OUTDIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 
-Point = Tuple[float, float]
-BBox = Tuple[float, float, float, float]
-
-
-# ---------------- Pomocné funkcie ----------------
-
-def load_json_data(json_path: str) -> Any:
-    """Načíta JSON súbor s UTF-8 kódovaním."""
-    with open(json_path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def compute_page_char_scale(annotations: Sequence[Dict[str, Any]]) -> Tuple[float, float]:
-    """Vypočíta priemernú šírku a výšku znakov na stránke."""
-    if not annotations:
-        return 30.0, 30.0
-
-    widths = [ann["bbox"][2] for ann in annotations]
-    heights = [ann["bbox"][3] for ann in annotations]
-
-    avg_w = float(np.mean(widths)) if widths else 30.0
-    avg_h = float(np.mean(heights)) if heights else 30.0
-
-    return (avg_w if avg_w > 1 else 30.0,
-            avg_h if avg_h > 1 else 30.0)
-
-
-def build_coco_index(
-    coco_data: Dict[str, Any],
-) -> Tuple[Dict[int, Dict[str, Any]], Dict[int, List[Dict[str, Any]]]]:
-    """Z coco anotácií spraví prehľadné indexy podľa image_id."""
-    images_by_id: Dict[int, Dict[str, Any]] = {
-        img["id"]: img for img in coco_data["images"]
-    }
-
-    annots_by_image: Dict[int, List[Dict[str, Any]]] = {img_id: [] for img_id in images_by_id}
-    for ann in coco_data["annotations"]:
-        annots_by_image[ann["image_id"]].append(ann)
-
-    return images_by_id, annots_by_image
-
-
-def find_candidates(
-    current_point: Point,
-    remaining_points: Sequence[Point],
-    page_char_scale: Tuple[float, float],
-    num_candidates: int,
-) -> List[Point]:
-    """
-    Inteligentný výber K kandidátov s prioritami:
-    1. Body v aktuálnom riadku (vpravo) - pokračovanie čítania
-    2. Body na začiatku ďalších riadkov - skákanie medzi riadkami
-    3. Najbližší body globálne - fallback
-
-    Toto zaistí logické čítanie s možnosťou skákať na ďalší riadok.
-    """
-    if not remaining_points:
-        return []
-
-    points_arr = np.array(remaining_points, dtype=float)
-    current_point_arr = np.array(current_point, dtype=float)
-    avg_w, avg_h = page_char_scale
-
-    candidates = []
-    used_points = set()
-
-    # PRIORITA 1: Body v aktuálnom riadku (vpravo od aktuálneho bodu)
-    # Tolerancia: ±40% výšky znaku
-    y_tolerance_same_line = avg_h * 0.4
-    same_line_mask = (
-        (points_arr[:, 0] > current_point_arr[0]) &  # Vpravo
-        (np.abs(points_arr[:, 1] - current_point_arr[1]) < y_tolerance_same_line)  # Podobná výška
-    )
-    same_line_points = points_arr[same_line_mask]
-
-    if len(same_line_points) > 0:
-        # Zoraď podľa x-pozície (ľava-doprava)
-        indices = np.where(same_line_mask)[0]
-        sorted_indices = indices[np.argsort(same_line_points[:, 0])]
-        for idx in sorted_indices:
-            pt = points_arr[idx]
-            candidates.append(tuple(pt))
-            used_points.add(tuple(pt))
-            if len(candidates) >= num_candidates:
-                return candidates
-
-    # PRIORITA 2: Body na začiatku ďalších riadkov (skákanie medzi riadkami)
-    # Hľadaj v NUM_LINES_BELOW riadkoch nižšie
-    for line_offset in range(1, NUM_LINES_BELOW + 1):
-        # Presná pozícia riadka
-        line_y = current_point_arr[1] + line_offset * avg_h
-
-        # Tolerancia: ±50% výšky znaku
-        line_tolerance = avg_h * 0.8
-        line_mask = np.abs(points_arr[:, 1] - line_y) < line_tolerance
-        line_points = points_arr[line_mask]
-
-        if len(line_points) > 0:
-            # Na tomto riadku: zoraď podľa x-pozície od začiatku
-            indices = np.where(line_mask)[0]
-            x_positions = line_points[:, 0]
-            sorted_line_indices = indices[np.argsort(x_positions)]
-
-            for idx in sorted_line_indices:
-                pt = points_arr[idx]
-                pt_tuple = tuple(pt)
-                if pt_tuple not in used_points:
-                    candidates.append(pt_tuple)
-                    used_points.add(pt_tuple)
-                    if len(candidates) >= num_candidates:
-                        return candidates
-
-    # PRIORITA 3: Globálne najbližší body (fallback)
-    # Vypočítaj vzdialenosti ku všetkým zvyšným bodom
-    remaining_mask = np.ones(len(points_arr), dtype=bool)
-    for used_pt in used_points:
-        # Nájdi index bodu v points_arr
-        for i, pt in enumerate(points_arr):
-            if abs(pt[0] - used_pt[0]) < 0.01 and abs(pt[1] - used_pt[1]) < 0.01:
-                remaining_mask[i] = False
-                break
-
-    remaining_arr = points_arr[remaining_mask]
-    if len(remaining_arr) > 0:
-        distances = np.linalg.norm(remaining_arr - current_point_arr, axis=1)
-        sorted_indices = np.argsort(distances)
-
-        for idx in sorted_indices:
-            pt = remaining_arr[idx]
-            pt_tuple = tuple(pt)
-            candidates.append(pt_tuple)
-            if len(candidates) >= num_candidates:
-                return candidates
-
-    # Vráť presne num_candidates (doplň posledným ak je menej)
-    while len(candidates) < num_candidates:
-        if candidates:
-            candidates.append(candidates[-1])
-        else:
-            candidates.append(tuple(current_point_arr))
-
-    return candidates[:num_candidates]
-
-
-
-
-# ---------------- Prostredie ----------------
-
-class ReadingEnv(gym.Env):
-    """
-    Prostredie, kde agent číta body na stránke.
-
-    Pozorovanie:
-      - vektor relatívnych pozícií kandidátov k aktuálnemu bodu,
-        škálovaný podľa priemernej veľkosti znakov (x/avg_w, y/avg_h)
-
-    Akcie:
-      - index zvoleného kandidáta (Discrete(num_candidates))
-    """
-
-    metadata = {"render_modes": []}
-
-    def __init__(self, num_candidates: int) -> None:
-        super().__init__()
-
-        self.num_candidates = num_candidates
-        obs_dim = 2 * num_candidates  # (dx, dy) pre každý kandidát
-
-        self.observation_space = spaces.Box(
-            low=-100.0,
-            high=100.0,
-            shape=(obs_dim,),
-            dtype=np.float32,
-        )
-        self.action_space = spaces.Discrete(num_candidates)
-
-        # (avg_w, avg_h)
-        self.page_char_scale: Tuple[float, float] = (30.0, 30.0)
-
-        self.all_page_points: List[Point] = []
-        self.remaining_points: List[Point] = []
-        self.current_point: Optional[Point] = None
-        self.annotations: List[Dict[str, Any]] = []
-
-    # --- vnútorné pomocné metódy ---
-
-    def _empty_obs(self) -> np.ndarray:
-        return np.zeros(self.observation_space.shape, dtype=np.float32)
-
-    def _build_observation(self) -> np.ndarray:
-        """Vytvorí pozorovanie z aktuálneho bodu a kandidátov."""
-        if self.current_point is None:
-            return self._empty_obs()
-
-        candidates = find_candidates(
-            current_point=self.current_point,
-            remaining_points=self.remaining_points,
-            page_char_scale=self.page_char_scale,
-            num_candidates=self.num_candidates,
-        )
-
-        if not candidates:
-            return self._empty_obs()
-
-        current_point_arr = np.array(self.current_point, dtype=float)
-        avg_w, avg_h = self.page_char_scale
-
-        obs_vectors: List[float] = []
-        for cand in candidates:
-            cand_arr = np.array(cand, dtype=float)
-            rel_vec = cand_arr - current_point_arr
-            # škálovanie podľa priemernej veľkosti znaku
-            obs_vectors.extend([
-                float(rel_vec[0] / avg_w),
-                float(rel_vec[1] / avg_h),
-            ])
-
-        return np.array(obs_vectors, dtype=np.float32)
-
-    # --- Gym API ---
-
-    def reset(
-        self,
-        *,
-        seed: Optional[int] = None,
-        options: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[np.ndarray, Dict[str, Any]]:
-        super().reset(seed=seed)
-
-        if options is None or "all_points" not in options or "annotations" not in options:
-            if hasattr(self, "expert_data_ref") and self.expert_data_ref:
-                import random
-                item = random.choice(self.expert_data_ref)
-                img_file = item.get("image_file")
-                img_id = getattr(self, "file_to_id_ref", {}).get(img_file)
-                page_annotations = getattr(self, "coco_annots_ref", {}).get(img_id, [])
-                all_points_on_page = [tuple(t["center"]) for t in item["trajectory"]] if "trajectory" in item else [(0.0, 0.0)]
-                if not all_points_on_page:
-                    all_points_on_page = [(0.0, 0.0)]
-                options = {"all_points": all_points_on_page, "annotations": page_annotations}
-            else:
-                raise ValueError(
-                    "Musíte poskytnúť 'all_points' a 'annotations' v options pri resete."
-                )
-
-        self.all_page_points = list(map(tuple, options["all_points"]))
-        self.annotations = list(options["annotations"])
-
-        # aktualizuj škálu znakov podľa anotácií
-        self.page_char_scale = compute_page_char_scale(self.annotations)
-
-        if not self.all_page_points:
-            self.current_point = (0.0, 0.0)
-            self.remaining_points = []
-            return self._empty_obs(), {}
-
-        # nájdi najvyšší bod (najmenšie y)
-        points_arr = np.array(self.all_page_points, dtype=float)
-        top_idx = int(np.argmin(points_arr[:, 1]))
-        top_y = float(points_arr[top_idx, 1])
-
-        # prvý riadok: body, ktoré majú y blízko top_y
-        _, avg_h = self.page_char_scale
-        first_line_candidates = [
-            p for p in self.all_page_points
-            if abs(p[1] - top_y) < avg_h * 0.75
-        ]
-
-        # štartovací bod: najviac vľavo
-        start_point = min(first_line_candidates, key=lambda p: p[0])
-
-        self.current_point = (float(start_point[0]), float(start_point[1]))
-        self.remaining_points = [
-            p for p in self.all_page_points if p != self.current_point
-        ]
-
-        obs = self._build_observation()
-        info: Dict[str, Any] = {}
-        return obs, info
-
-    def step(
-        self,
-        action: int,
-    ) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
-        """Posunie sa na bod zvolený akciou medzi kandidátmi."""
-        if self.current_point is None:
-            return self._empty_obs(), 0.0, True, False, {}
-
-        candidates = find_candidates(
-            current_point=self.current_point,
-            remaining_points=self.remaining_points,
-            page_char_scale=self.page_char_scale,
-            num_candidates=self.num_candidates,
-        )
-
-        if not candidates or action >= len(candidates):
-            # neplatná akcia alebo žiadni kandidáti -> koniec epizódy
-            return self._build_observation(), 0.0, True, False, {}
-
-        chosen_point = candidates[action]
-
-        self.current_point = chosen_point
-        self.remaining_points = [
-            p for p in self.remaining_points if tuple(p) != tuple(chosen_point)
-        ]
-
-        done = len(self.remaining_points) == 0
-        obs = self._build_observation()
-        reward = 0.0
-        truncated = False
-        info: Dict[str, Any] = {}
-
-        return obs, reward, done, truncated, info
 
 
 # ---------------- Príprava dát + Tréning BC ----------------
@@ -1188,10 +881,11 @@ def trajectory_to_string(
     model_traj: List[Point],
     all_annots_on_page: List[Dict[str, Any]],
     categories: Dict[int, str],
+    is_yolo: bool = False
 ) -> str:
     """
     Konvertuje model trajektóriu (seznam bodov) na string znakov.
-    Mapuje body na najbližšie anotácie a zoberá ich labels.
+    Mapuje body na najbližšie anotácie a zoberie ich labels.
     """
     if not model_traj or not all_annots_on_page:
         return ""
@@ -1201,26 +895,18 @@ def trajectory_to_string(
     for point in model_traj:
         point_arr = np.array(point, dtype=float)
         
-        # Nájdi najbližšiu anotáciu k tomuto bodu
+        # Nájdí najbližšiu anotáciu k tomuto bodu
         min_distance = float('inf')
         closest_ann = None
         
         for ann in all_annots_on_page:
-            bbox = ann["bbox"]  # x, y, w, h
-            x, y, w, h = bbox
-            cx = x + w / 2.0
-            cy = y + h / 2.0
-            
-            # Apply the same adjustments as in point generation
-            label = categories.get(ann["category_id"], "")
-            if label == "1":
-                cy += h * 0.1
-            elif label == "6":
-                cx -= w * 0.15
-                cy += h * 0.15
-            elif label == "9":
-                cx += w * 0.15
-                cy -= h * 0.2
+            if is_yolo:
+                # Pre YOLO získame priamo string z YOLO triedy, nie z COCO mappingu, aby sme predišli nesúladu ID.
+                label = ann.get("yolo_label", str(ann["category_id"]))
+                cx, cy = ann["centroid"]
+            else:
+                label = categories.get(ann["category_id"], "")
+                cx, cy = ann["centroid"]
             
             # Vypočítaj vzdialenosť
             ann_center = np.array([cx, cy], dtype=float)
@@ -1232,8 +918,11 @@ def trajectory_to_string(
         
         # Ak máme najbližšiu anotáciu, pridaj jej label do stringu
         if closest_ann is not None:
-            label: str = categories.get(closest_ann["category_id"], "")
-            result_string += label
+            if is_yolo:
+                label = closest_ann.get("yolo_label", str(closest_ann["category_id"]))
+            else:
+                label = categories.get(closest_ann["category_id"], "")
+            result_string += str(label)
     
     return result_string
 
@@ -1297,6 +986,10 @@ print("="*70)
 
 print("\nGenerating and evaluating trajectories for all available models...")
 
+# Nacitanie YOLO detekcii
+YOLO_JSON = "yolo_detections.json"
+yolo_data = load_json_data(YOLO_JSON) if os.path.exists(YOLO_JSON) else {}
+
 categories: Dict[int, str] = {
     c["id"]: c["name"] for c in coco_data.get("categories", [])
 }
@@ -1321,105 +1014,111 @@ for model_name, model_path in models_to_evaluate.items():
         continue
 
     print(f"\n[{model_name}] Načítavam a vyhodnocujem model...")
-    eval_model = ActorCriticPolicy(
-        observation_space=env.observation_space,
-        action_space=env.action_space,
-        net_arch=[64, 64],
-        lr_schedule=lambda _: 3e-4,
-    )
-    eval_model.load_state_dict(torch.load(model_path, map_location=DEVICE))
-    eval_model.eval()
-
-    comparison_results = []
-    
-    outdir_model = f"{OUTDIR}_{model_name.lower()}"
-    diff_dir_model = f"diffs_{model_name.lower()}"
-    os.makedirs(outdir_model, exist_ok=True)
-    
-    for item in expert_data:
-        img_file = item.get("image_file")
-        if not img_file:
+    for data_mode in ["COCO", "YOLO"]:
+        if data_mode == "YOLO" and not yolo_data:
+            print("[YOLO] Data sa nenašli, preskakujem YOLO evaluáciu.")
             continue
+            
+        print(f"[{model_name}] Beh na dátach: {data_mode}")
+        
+        # Set up result structures
+        eval_model = ActorCriticPolicy(
+            observation_space=env.observation_space,
+            action_space=env.action_space,
+            net_arch=[64, 64],
+            lr_schedule=lambda _: 3e-4,
+        )
+        eval_model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+        eval_model.eval()
 
-        img_id = file_to_id.get(img_file)
-        if img_id is None:
-            continue
+        comparison_results = []
+        
+        result_key = f"{model_name}" if data_mode == "COCO" else f"{model_name} (YOLO)"
+        outdir_model = f"{OUTDIR}_{model_name.lower()}" if data_mode == "COCO" else f"{OUTDIR}_{model_name.lower()}_yolo"
+        diff_dir_model = f"diffs_{model_name.lower()}" if data_mode == "COCO" else f"diffs_{model_name.lower()}_yolo"
+        os.makedirs(outdir_model, exist_ok=True)
+        os.makedirs(diff_dir_model, exist_ok=True)
+        
+        for item in expert_data:
+            img_file = item.get("image_file")
+            if not img_file:
+                continue
 
-        all_annots_on_page = coco_annots.get(img_id, [])
+            all_points: List[Point] = []
+            all_annots_on_page: List[Dict[str, Any]] = []
 
-        all_points: List[Point] = []
-        for ann in all_annots_on_page:
-            bbox: BBox = tuple(ann["bbox"])
-            label = categories.get(ann["category_id"], "")
+            if data_mode == "COCO":
+                img_id = file_to_id.get(img_file)
+                if img_id is None:
+                    continue
+                all_annots_on_page = coco_annots.get(img_id, [])
+                all_points, all_annots_on_page = BaseDataLoader.parse_coco(all_annots_on_page, categories)
+            else:
+                # YOLO Data Loading pomocou BaseDataLoader
+                yolo_annots = yolo_data.get(img_file, [])
+                if not yolo_annots:
+                    continue
+                # Vráti [((cx, cy)), ...], [{"category_id": x, ...}, ...]
+                all_points, all_annots_on_page = BaseDataLoader.parse_yolo(yolo_annots, confidence_threshold=0.0)
 
-            x, y, w, h = bbox
-            cx = x + w / 2.0
-            cy = y + h / 2.0
+            if not all_points:
+                continue
 
-            if label == "1":
-                cy += h * 0.1
-            elif label == "6":
-                cx -= w * 0.15
-                cy += h * 0.15
-            elif label == "9":
-                cx += w * 0.15
-                cy -= h * 0.2
-            all_points.append((cx, cy))
+            obs, _ = env.reset(options={"all_points": all_points, "annotations": all_annots_on_page})
 
-        obs, _ = env.reset(options={"all_points": all_points, "annotations": all_annots_on_page})
-
-        model_traj: List[Point] = []
-        if env.current_point is not None:
-            model_traj.append(env.current_point)
-
-        done = False
-        while not done:
-            action, _ = eval_model.predict(obs, deterministic=True)
-            obs, _, done, _, _ = env.step(int(action))
+            model_traj: List[Point] = []
             if env.current_point is not None:
                 model_traj.append(env.current_point)
 
-        # Porovnanie
-        model_string = trajectory_to_string(model_traj, all_annots_on_page, categories)
-        expected_string = load_expected_string(img_file)
+            done = False
+            while not done:
+                action, _ = eval_model.predict(obs, deterministic=True)
+                obs, _, done, _, _ = env.step(int(action))
+                if env.current_point is not None:
+                    model_traj.append(env.current_point)
+
+            # Porovnanie
+            is_yolo = (data_mode == "YOLO")
+            model_string = trajectory_to_string(model_traj, all_annots_on_page, categories, is_yolo=is_yolo)
+            expected_string = load_expected_string(img_file)
+            
+            if expected_string:
+                metrics = compare_strings_with_rapidfuzz(model_string, expected_string)
+                comparison_results.append({
+                    "image_file": img_file,
+                    "model_string": model_string,
+                    "expected_string": expected_string,
+                    "metrics": metrics,
+                })
+                create_html_diff(model_string, expected_string, img_file, output_dir=diff_dir_model)
+            
+            # Kreslenie
+            img_path = os.path.join(IMAGE_DIR, img_file)
+            out_path = os.path.join(outdir_model, img_file)
+
+            img = cv2.imread(img_path)
+            if img is None:
+                img = 255 * np.ones((2000, 2000, 3), dtype=np.uint8)
+
+            for pair in item.get("expert_pairs", []):
+                p_start = tuple(map(int, pair["state"]))
+                p_end = tuple(map(int, pair["action"]))
+                cv2.arrowedLine(img, p_start, p_end, color=(0, 0, 255), thickness=3, tipLength=0)
+
+            for i in range(len(model_traj) - 1):
+                p0 = tuple(map(int, model_traj[i]))
+                p1 = tuple(map(int, model_traj[i + 1]))
+                cv2.line(img, p0, p1, color=(0, 255, 0), thickness=2)
+
+            cv2.imwrite(out_path, img)
         
-        if expected_string:
-            metrics = compare_strings_with_rapidfuzz(model_string, expected_string)
-            comparison_results.append({
-                "image_file": img_file,
-                "model_string": model_string,
-                "expected_string": expected_string,
-                "metrics": metrics,
-            })
-            create_html_diff(model_string, expected_string, img_file, output_dir=diff_dir_model)
-        
-        # Kreslenie
-        img_path = os.path.join(IMAGE_DIR, img_file)
-        out_path = os.path.join(outdir_model, img_file)
-
-        img = cv2.imread(img_path)
-        if img is None:
-            img = 255 * np.ones((2000, 2000, 3), dtype=np.uint8)
-
-        for pair in item.get("expert_pairs", []):
-            p_start = tuple(map(int, pair["state"]))
-            p_end = tuple(map(int, pair["action"]))
-            cv2.arrowedLine(img, p_start, p_end, color=(0, 0, 255), thickness=3, tipLength=0)
-
-        for i in range(len(model_traj) - 1):
-            p0 = tuple(map(int, model_traj[i]))
-            p1 = tuple(map(int, model_traj[i + 1]))
-            cv2.line(img, p0, p1, color=(0, 255, 0), thickness=2)
-
-        cv2.imwrite(out_path, img)
-    
-    all_model_results[model_name] = comparison_results
+        all_model_results[result_key] = comparison_results
 
 
 # ========== FINÁLNY REPORT ==========
 
 print("\n" + "="*70)
-print("FINÁLNY REPORT - POROVNANIE MODELOV (BC vs DAgger vs GAIL)")
+print("FINÁLNY REPORT - POROVNANIE MODELOV (BC vs DAgger vs GAIL) + YOLO veriante")
 print("="*70 + "\n")
 
 summary_table = []
@@ -1439,10 +1138,10 @@ for model_name, results in all_model_results.items():
     if lev_distances:
         avg_lev = np.mean(lev_distances)
         avg_sim = np.mean(similarities)
-        summary_table.append(f"{model_name:<10} | {avg_lev:>10.2f} | {avg_sim:>10.2f}%")
+        summary_table.append(f"{model_name:<16}  {avg_lev:>10.2f}  {avg_sim:>10.2f}%")
 
-print(f"{'Model':<10} | {'Avg L. Dist':>10} | {'Avg Similarity':>10}")
-print("-" * 38)
+print(f"{'Model':<16}  {'Avg L. Dist':>10}  {'Avg Similarity':>10}")
+print("-" * 44)
 for row in summary_table:
     print(row)
 

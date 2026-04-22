@@ -44,7 +44,7 @@ def main():
     detection_model = AutoDetectionModel.from_pretrained(
         model_type='yolov8',
         model_path=model_path,
-        confidence_threshold=0.5, # Pridaný confidence threshold (dá sa upraviť)
+        confidence_threshold=0.6, # Pridaný confidence threshold (dá sa upraviť)
         device=device,
     )
 
@@ -117,7 +117,8 @@ def main():
         for det in sorted_dets:
             final_list.append({
                 "class": det["class"],
-                "centroid": det["centroid"]
+                "centroid": det["centroid"],
+                "bbox": det["bbox"]
             })
             
         all_results[img_name] = final_list

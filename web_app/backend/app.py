@@ -13,11 +13,19 @@ from torchvision.ops import nms
 from rapidfuzz.distance import Levenshtein
 import difflib
 
+import sys
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+if ROOT_DIR not in sys.path:
+    sys.path.append(ROOT_DIR)
+
+from dp_core import BaseDataLoader, ReadingEnv
+from stable_baselines3.common.policies import ActorCriticPolicy
+from gymnasium import spaces
+
 app = Flask(__name__)
 CORS(app)
 
 # --- Model a dátové cesty ---
-ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 YOLO_MODELS_DIR = ROOT_DIR
 IMITATION_MODELS_DIR = ROOT_DIR
 
@@ -233,14 +241,70 @@ def upload_file():
         draw_bounding_boxes(filepath, boxes, labels, processed_image_path)
 
         # 2. Príprava dát pre imitačný model
-        avg_char_height = calculate_avg_char_height(boxes)
-        centroids = calculate_centroids_with_offsets(boxes, labels)
-        sorted_centroids, sorted_labels = sort_centroids(centroids, labels, avg_char_height)
-        
-        # 3. Imitačný model (Behavioral Cloning)
-        # V tejto zjednodušenej verzii len prechádzame cez zoradené centroidy
-        trajectory_points = sorted_centroids
-        trajectory_labels = sorted_labels
+        yolo_dict_format = []
+        for box, label, score in zip(boxes, labels, scores):
+            x1, y1, x2, y2 = box
+            cx, cy = x1 + (x2 - x1) / 2, y1 + (y2 - y1) / 2
+            yolo_dict_format.append({
+                "class": label,
+                "centroid": [cx, cy],
+                "bbox": box,
+                "confidence": score
+            })
+
+        all_points, all_annots = BaseDataLoader.parse_yolo(yolo_dict_format)
+
+        trajectory_points = []
+        trajectory_labels = []
+
+        try:
+            # 3. Imitačný model (Inferencia cez natrénovaný RL model)
+            eval_model = ActorCriticPolicy(
+                observation_space=spaces.Box(low=-100.0, high=100.0, shape=(30,), dtype=np.float32), 
+                action_space=spaces.Discrete(15), 
+                net_arch=[64, 64], 
+                lr_schedule=lambda _: 3e-4
+            )
+            eval_model.load_state_dict(torch.load(imitation_model_path, map_location="cpu"))
+            eval_model.eval()
+
+            env = ReadingEnv(num_candidates=15)
+            obs, _ = env.reset(options={"all_points": all_points, "annotations": all_annots})
+
+            def get_closest_label(pt, annots):
+                pt_arr = np.array(pt, dtype=float)
+                min_dist = float('inf')
+                best_label = ""
+                for ann in annots:
+                    dist = np.linalg.norm(pt_arr - np.array(ann["centroid"], dtype=float))
+                    if dist < min_dist:
+                        min_dist = dist
+                        best_label = ann["yolo_label"]
+                return best_label
+
+            if env.current_point is not None:
+                trajectory_points.append(env.current_point)
+                trajectory_labels.append(get_closest_label(env.current_point, all_annots))
+
+            done = False
+            max_steps = len(all_points) * 2
+            steps = 0
+            while not done and steps < max_steps:
+                action, _ = eval_model.predict(obs, deterministic=True)
+                obs, _, done, _, _ = env.step(int(action))
+                if env.current_point is not None:
+                    trajectory_points.append(env.current_point)
+                    trajectory_labels.append(get_closest_label(env.current_point, all_annots))
+                steps += 1
+
+        except Exception as e:
+            app.logger.warning(f"Inferencia RL modelu zlyhala, pouzivam fallback (sorting): {e}")
+            # Fallback na sorting (ak model padne alebo nenajde action)
+            avg_char_height = calculate_avg_char_height(boxes)
+            centroids = calculate_centroids_with_offsets(boxes, labels)
+            sorted_centroids, sorted_labels = sort_centroids(centroids, labels, avg_char_height)
+            trajectory_points = sorted_centroids
+            trajectory_labels = sorted_labels
         
         # Vykreslenie trajektórie
         trajectory_image_filename = f"trajectory_{filename}"
