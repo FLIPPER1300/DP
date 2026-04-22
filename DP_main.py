@@ -58,14 +58,8 @@ NUM_CANDIDATES = 15
 NUM_LINES_BELOW = 3  # Počet riadkov pod aktuálnym, v ktorých hľadáme kandidátov
 DAGGER_ITERATIONS = 2  # Počet iterácií
 
-# Debug nastavenia
-DEBUG_CANDIDATES = False  # Ak True, vypíše info o kandidátoch pri generovaní
-DEBUG_TRAJECTORY = False  # Ak True, vypíše detaily o každom kroku trajektórieí
-
 os.makedirs(OUTDIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
-
-
 
 # ---------------- Príprava dát + Tréning BC ----------------
 
@@ -88,127 +82,6 @@ def build_observation_from_candidates(
         ])
 
     return np.array(obs_vectors, dtype=np.float32)
-
-
-def diagnose_candidate_coverage(
-    expert_data: List[Dict[str, Any]],
-    coco_data: Dict[str, Any],
-    num_candidates: int,
-) -> Dict[str, Any]:
-    """
-    Diagnostika: Overí pokrytie expert_pair kandidátmi.
-
-    DÔLEŽITÉ: expert_pairs sú ručne upravené a neusia byť v poradí trajectory!
-    Táto diagnostika skontroluje, či expert_next_point je dostupný v candidates.
-    """
-    total_pairs = 0
-    covered_pairs = 0
-    uncovered_samples = []
-    distances_to_expert = []
-
-    coco_images, coco_annots = build_coco_index(coco_data)
-    file_to_id: Dict[str, int] = {
-        img_info["file_name"]: img_id
-        for img_id, img_info in coco_images.items()
-    }
-
-    for item in expert_data:
-        img_file = item.get("image_file")
-        if not img_file:
-            continue
-
-        img_id = file_to_id.get(img_file)
-        if img_id is None:
-            continue
-
-        page_annotations = coco_annots.get(img_id, [])
-        if not page_annotations:
-            continue
-
-        page_char_scale = compute_page_char_scale(page_annotations)
-        all_points_on_page: List[Point] = [
-            tuple(t["center"]) for t in item["trajectory"]
-        ]
-
-        for pair_idx, pair in enumerate(item["expert_pairs"]):
-            total_pairs += 1
-            current_point: Point = tuple(pair["state"])
-            expert_next_point: Point = tuple(pair["action"])
-
-            # Overíme či expert_next_point je vôbec na stránke
-            if expert_next_point not in all_points_on_page:
-                uncovered_samples.append({
-                    "reason": "expert_point_not_on_page",
-                    "img_file": img_file,
-                    "pair_idx": pair_idx,
-                    "expert_point": expert_next_point,
-                    "current_point": current_point,
-                })
-                continue
-
-            remaining_points = [
-                p for p in all_points_on_page if tuple(p) != tuple(current_point)
-            ]
-
-            candidates = find_candidates(
-                current_point=current_point,
-                remaining_points=remaining_points,
-                page_char_scale=page_char_scale,
-                num_candidates=num_candidates,
-            )
-
-            if not candidates:
-                uncovered_samples.append({
-                    "reason": "no_candidates",
-                    "img_file": img_file,
-                    "pair_idx": pair_idx,
-                    "expert_point": expert_next_point,
-                })
-                continue
-
-            try:
-                action_idx = candidates.index(expert_next_point)
-                covered_pairs += 1
-                distances_to_expert.append(0.0)
-            except ValueError:
-                # Expert bod nie je v kandidátoch
-                closest_candidate = min(
-                    candidates,
-                    key=lambda c: np.linalg.norm(
-                        np.array(c) - np.array(expert_next_point)
-                    )
-                )
-                dist = float(np.linalg.norm(
-                    np.array(closest_candidate) - np.array(expert_next_point)
-                ))
-                distances_to_expert.append(dist)
-
-                uncovered_samples.append({
-                    "reason": "expert_not_in_candidates",
-                    "img_file": img_file,
-                    "pair_idx": pair_idx,
-                    "expert_point": expert_next_point,
-                    "current_point": current_point,
-                    "num_candidates": len(candidates),
-                    "closest_candidate": closest_candidate,
-                    "distance_to_expert": dist,
-                    "page_char_scale": page_char_scale,
-                })
-
-    coverage_percent = (covered_pairs / total_pairs * 100) if total_pairs > 0 else 0.0
-    avg_distance = float(np.mean(distances_to_expert)) if distances_to_expert else 0.0
-    max_distance = float(np.max(distances_to_expert)) if distances_to_expert else 0.0
-
-    return {
-        "total_pairs": total_pairs,
-        "covered_pairs": covered_pairs,
-        "coverage_percent": coverage_percent,
-        "uncovered_pairs": len(uncovered_samples),
-        "avg_distance_to_expert": avg_distance,
-        "max_distance_to_expert": max_distance,
-        "uncovered_samples": uncovered_samples[:15],  # prvých 15
-    }
-
 
 def prepare_bc_data(
     expert_data: List[Dict[str, Any]],
@@ -785,60 +658,6 @@ if model is None:
         model.load_state_dict(torch.load(BC_MODEL_PATH, map_location=DEVICE))
         model.eval()
 
-# ---------------- Diagnostika kandidátov ----------------
-
-print("\n" + "="*70)
-print("DIAGNOSTIKA: Pokrytie expert_pairs kandidátmi")
-print("="*70)
-
-diag_result = diagnose_candidate_coverage(
-    expert_data=expert_data,
-    coco_data=coco_data,
-    num_candidates=NUM_CANDIDATES,
-)
-
-print(f"Celkovo expert_pairs: {diag_result['total_pairs']}")
-print(f"Expert body V kandidátoch: {diag_result['covered_pairs']}")
-print(f"Expert body MIMO kandidátov: {diag_result['uncovered_pairs']}")
-print(f"\n[OK] Pokrytie: {diag_result['coverage_percent']:.2f}%")
-print(f"[VZDIALENOST] Primerná vzdialenosť k expert bodu (keď nie je v kandidátoch): {diag_result['avg_distance_to_expert']:.2f} px")
-print(f"[VZDIALENOST] Max vzdialenosť: {diag_result['max_distance_to_expert']:.2f} px")
-
-if diag_result['uncovered_samples']:
-    print(f"\nPríklady NEPOKRYTÝCH expert_pairs (prvých 15):")
-    for i, sample in enumerate(diag_result['uncovered_samples'], 1):
-        print(f"\n  {i}. [{sample['reason']}] - {sample['img_file']}")
-        print(f"     Current: {sample['current_point']}")
-        print(f"     Expert bod: {sample['expert_point']}")
-
-        if sample['reason'] == "expert_not_in_candidates":
-            closest = sample['closest_candidate']
-            dist = sample['distance_to_expert']
-            avg_w, avg_h = sample['page_char_scale']
-            dist_in_chars = dist / max(avg_w, avg_h)
-            print(f"     Najbližší kandidát: {closest}")
-            print(f"     Vzdialenosť: {dist:.1f} px ({dist_in_chars:.1f} znakov)")
-            print(f"     Počet kandidátov: {sample['num_candidates']}")
-
-print("\n" + "="*70)
-
-if diag_result['coverage_percent'] < 90.0:
-    print("[ERROR] PROBLÉM: Menej ako 90% pokrytia - potrebujeme vylepšenie!")
-    print("\nNavrhy na vylepšenie:")
-    print(f"1. Zvýš NUM_LINES_BELOW (teraz = {NUM_LINES_BELOW}) → skúsiť 4-6")
-    print(f"2. Zvýš NUM_CANDIDATES (teraz = {NUM_CANDIDATES}) → skúsiť 15-20")
-    print("3. Zväčší y_tolerance pre hľadanie v riadkoch")
-elif diag_result['coverage_percent'] < 98.0:
-    print("[INFO] PRIJATEĽNÉ: 90-98% pokrytia, ale dá sa vylepšiť")
-    print("\nNavrhy: Zvýš NUM_LINES_BELOW alebo NUM_CANDIDATES")
-else:
-    print("[OK] SKVELÉ: Pokrytie >= 98% - expert body sú dostupní!")
-    print("\nAk je presnosť modelu nižšia ako pokrytie, problém je v modeli,")
-    print("nie v kandidátoch!")
-
-print("="*70 + "\n")
-
-
 # ============ FUNKCIE PRE POROVNÁVANIE STRINGOV S RAPIDFUZZ ============
 
 def create_html_diff(model_string: str, expected_string: str, img_file: str, output_dir: str = "diffs") -> None:
@@ -875,7 +694,6 @@ def create_html_diff(model_string: str, expected_string: str, img_file: str, out
         f.write(html)
     
     print(f"      Diff HTML: {output_file}")
-
 
 def trajectory_to_string(
     model_traj: List[Point],
@@ -975,12 +793,9 @@ def compare_strings_with_rapidfuzz(
         "expected_length": len(expected_string),
     }
 
-
 print("\n" + "="*70)
 print("Tréning dokončený!")
 print("="*70)
-
-
 
 # ---------------- Generovanie a kreslenie trajektórií ----------------
 
@@ -1118,7 +933,7 @@ for model_name, model_path in models_to_evaluate.items():
 # ========== FINÁLNY REPORT ==========
 
 print("\n" + "="*70)
-print("FINÁLNY REPORT - POROVNANIE MODELOV (BC vs DAgger vs GAIL) + YOLO veriante")
+print("FINÁLNY REPORT - POROVNANIE MODELOV (BC vs DAgger vs GAIL) + YOLO verianty")
 print("="*70 + "\n")
 
 summary_table = []
