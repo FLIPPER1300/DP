@@ -190,7 +190,8 @@ def levenshtein_distance_and_accuracy(s1, s2):
         return 0, 100.0
     
     dist = Levenshtein.distance(s1, s2)
-    accuracy = Levenshtein.normalized_similarity(s1, s2) * 100.0
+    max_len = max(len(s1), len(s2))
+    accuracy = (1 - (dist / max_len)) * 100.0 if max_len > 0 else 100.0
     return dist, accuracy
 
 def wrap_string(s, width=80):
@@ -323,15 +324,15 @@ def upload_file():
         if expected_string:
             distance, accuracy = levenshtein_distance_and_accuracy(expected_string, detected_string)
             
-            # Použi difflib.HtmlDiff rovnako ako v DP_main.py
+            # Použi difflib.HtmlDiff rovnako ako v DP_main.py (prvý je výstup modelu, druhý je expert)
             expected_lines = wrap_string(expected_string, width=80)
             detected_lines = wrap_string(detected_string, width=80)
             
-            fromdesc = "Expected string"
-            todesc = "Detected string"
+            fromdesc = "Detected string"
+            todesc = "Expected string"
             
             diff_table = difflib.HtmlDiff(wrapcolumn=80).make_table(
-                expected_lines, detected_lines,
+                detected_lines, expected_lines,
                 fromdesc=fromdesc,
                 todesc=todesc
             )
