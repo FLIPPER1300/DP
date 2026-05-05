@@ -49,11 +49,11 @@ OUTDIR = "image_bc_traj"
 BC_MODEL_PATH = "bc_model.pt"
 LOG_DIR = "logs/bc_reader_final"
 
-TRAIN_BC = True
-TRAIN_DAGGER = True
+TRAIN_BC = False
+TRAIN_DAGGER = False
 TRAIN_GAIL = True
 GAIL_START_MODEL = "dagger"  # prepínač: "bc" alebo "dagger". Určuje, aký model sa použije na začiatku GAIL
-N_EPOCHS = 20
+N_EPOCHS = 50
 NUM_CANDIDATES = 15
 NUM_LINES_BELOW = 3  # Počet riadkov pod aktuálnym, v ktorých hľadáme kandidátov
 DAGGER_ITERATIONS = 2  # Počet iterácií
@@ -436,7 +436,7 @@ if TRAIN_BC:
         observation_space=env.observation_space,
         action_space=env.action_space,
         net_arch=[64, 64],
-        lr_schedule=lambda _: 3e-4,
+        lr_schedule=lambda _: 1e-4,
     )
 
     trainer = bc.BC(
@@ -479,7 +479,7 @@ if TRAIN_DAGGER:
             observation_space=env.observation_space,
             action_space=env.action_space,
             net_arch=[64, 64],
-            lr_schedule=lambda _: 3e-4,
+            lr_schedule=lambda _: 1e-4,
         )
     
     print("\n" + "="*70)
@@ -526,7 +526,7 @@ if TRAIN_DAGGER:
             observation_space=env.observation_space,
             action_space=env.action_space,
             net_arch=[64, 64],
-            lr_schedule=lambda _: 5e-4,  # Dočasne vyšší LR na "nakopnutie"
+            lr_schedule=lambda _: 1e-4,  # Dočasne vyšší LR na "nakopnutie"
         )
         # Načítaj váhy z predchádzajúceho modelu
         policy_dagger.load_state_dict(model.state_dict())
@@ -626,7 +626,7 @@ if TRAIN_GAIL:
     gail_trainer = GAIL(
         demonstrations=transitions,
         demo_batch_size=128,           # Zvýšená vzorka z experta aby lepšie porovnával
-        gen_replay_buffer_capacity=2048, 
+        gen_replay_buffer_capacity=2048,
         n_disc_updates_per_round=1,    
         venv=venv,
         gen_algo=learner,
@@ -635,7 +635,7 @@ if TRAIN_GAIL:
     )
     
     print("Spúšťam GAIL tréning (extrémne opatrný fine-tuning na dlhšiu dobu)...")
-    gail_trainer.train(total_timesteps=100000)
+    gail_trainer.train(total_timesteps=40000)
     
     model = learner.policy
     torch.save(model.state_dict(), BC_MODEL_PATH.replace(".pt", "_gail.pt"))
